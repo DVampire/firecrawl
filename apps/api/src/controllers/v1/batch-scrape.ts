@@ -1,12 +1,12 @@
 import { Response } from "express";
-import { v4 as uuidv4 } from "uuid";
+import { config } from "../../config";
+import { v7 as uuidv7 } from "uuid";
 import {
   BatchScrapeRequest,
   batchScrapeRequestSchema,
   batchScrapeRequestSchemaNoURLValidation,
   url as urlSchema,
   RequestWithAuth,
-  ScrapeOptions,
   BatchScrapeResponse,
 } from "./types";
 import {
@@ -14,51 +14,311 @@ import {
   finishCrawlKickoff,
   getCrawl,
   lockURLs,
+  markCrawlActive,
   saveCrawl,
   StoredCrawl,
 } from "../../lib/crawl-redis";
-import { logCrawl } from "../../services/logging/crawl_log";
 import { getJobPriority } from "../../lib/job-priority";
 import { addScrapeJobs } from "../../services/queue-jobs";
-import { callWebhook } from "../../services/webhook";
+import { createWebhookSender, WebhookEvent } from "../../services/webhook";
 import { logger as _logger } from "../../lib/logger";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
+import { requestContext } from "../../lib/request-context";
+import { service } from "../../service";
+import { fromV1ScrapeOptions } from "../v2/types";
+import { checkPermissions } from "../../lib/permissions";
+import { resolveSafeMode } from "../../lib/safe-mode";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
+import { billTeam } from "../../services/billing/credit_billing";
+import {
+  actionTypesOf,
+  checkKeyFormatRestriction,
+  formatTypesOf,
+} from "../../lib/key-restriction";
+import {
+  crawlGroup,
+  resolveNewGroupBackend,
+} from "../../services/worker/nuq-router";
+import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { emitRejectedScrapeActivityEvents } from "../../lib/siem-logging";
+import { UnsupportedSiteError } from "../../lib/error";
+import { requestCreditsShards } from "../../lib/request-credits-store";
 
 export async function batchScrapeController(
   req: RequestWithAuth<{}, BatchScrapeResponse, BatchScrapeRequest>,
   res: Response<BatchScrapeResponse>,
 ) {
+  const preNormalizedBody = { ...req.body };
   if (req.body?.ignoreInvalidURLs === true) {
     req.body = batchScrapeRequestSchemaNoURLValidation.parse(req.body);
   } else {
     req.body = batchScrapeRequestSchema.parse(req.body);
   }
 
-  const id = req.body.appendToId ?? uuidv4();
+  const safeMode = resolveSafeMode(req.acuc?.flags, req.body.safeMode);
+  if (safeMode.error) {
+    return res.status(403).json({
+      success: false,
+      code: safeMode.code,
+      error: safeMode.error,
+    } as any);
+  }
+
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+    force: safeMode.safeMode?.domainControls === true,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+
+  const permissions = checkPermissions(req.body, req.acuc?.flags, {
+    threatProtectionOrgConfig: threatProtection.orgConfig,
+    safeMode: safeMode.safeMode ?? null,
+  });
+  if (permissions.error) {
+    return res.status(403).json({
+      success: false,
+      code: permissions.code,
+      error: permissions.error,
+    });
+  }
+
+  const keyRestriction = await checkKeyFormatRestriction(
+    formatTypesOf(req.body.formats),
+    actionTypesOf(req.body.actions),
+    req.acuc?.api_key_id,
+    req.acuc?.flags ?? null,
+  );
+  if (!keyRestriction.allowed) {
+    return res.status(keyRestriction.status).json({
+      success: false,
+      error: keyRestriction.error,
+    });
+  }
+
+  // Safe Mode lockdown is cache-only, which implies zero data retention.
+  const zeroDataRetention =
+    getScrapeZDR(req.acuc?.flags) === "forced" ||
+    req.body.zeroDataRetention ||
+    (safeMode.safeMode?.lockdown ?? false);
+
+  // Only batch scrapes can be appended to: crawls (including monitor crawls)
+  // carry their own billing and scope.
+  const appendTarget = req.body.appendToId
+    ? ((await getCrawl(req.body.appendToId)) as StoredCrawl | null)
+    : null;
+  if (
+    req.body.appendToId &&
+    (!appendTarget ||
+      appendTarget.team_id !== req.auth.team_id ||
+      appendTarget.crawlerOptions != null)
+  ) {
+    return res.status(404).json({
+      success: false,
+      error: "Job not found",
+    });
+  }
+
+  const id = req.body.appendToId ?? uuidv7();
   const logger = _logger.child({
     crawlId: id,
     batchScrapeId: id,
     module: "api/v1",
     method: "batchScrapeController",
     teamId: req.auth.team_id,
-    plan: req.auth.plan,
+    zeroDataRetention,
   });
 
-  let urls = req.body.urls;
+  let urls: string[] = req.body.urls;
+  let unnormalizedURLs = preNormalizedBody.urls;
   let invalidURLs: string[] | undefined = undefined;
+  const locallyBlockedURLs: string[] = [];
+  const blockCtx = requestContext({
+    teamId: req.auth.team_id,
+    zeroDataRetention:
+      zeroDataRetention || appendTarget?.zeroDataRetention === true,
+    flags: req.acuc?.flags ?? null,
+    orgId: req.acuc?.org_id ?? null,
+  });
 
   if (req.body.ignoreInvalidURLs) {
     invalidURLs = [];
 
     let pendingURLs = urls;
     urls = [];
+    unnormalizedURLs = [];
     for (const u of pendingURLs) {
       try {
         const nu = urlSchema.parse(u);
-        urls.push(nu);
+        if (
+          !service.modules.blocklist.isBlocked(nu, blockCtx, {
+            origin: req.body.origin ?? null,
+          })
+        ) {
+          urls.push(nu);
+          unnormalizedURLs.push(u);
+        } else {
+          invalidURLs.push(u);
+          locallyBlockedURLs.push(nu);
+        }
       } catch (_) {
         invalidURLs.push(u);
       }
     }
+  } else {
+    const blockedURLs =
+      req.body.urls?.filter((url: string) =>
+        service.modules.blocklist.isBlocked(url, blockCtx, {
+          origin: req.body.origin ?? null,
+        }),
+      ) ?? [];
+    if (blockedURLs.length > 0) {
+      locallyBlockedURLs.push(...blockedURLs);
+      emitRejectedScrapeActivityEvents(
+        locallyBlockedURLs.map(url => ({
+          scrapeId: uuidv7(),
+          requestId: id,
+          endpoint: "batch_scrape",
+          teamId: req.auth.team_id,
+          apiKeyId: req.acuc?.api_key_id ?? null,
+          auditMetadata: req.body.auditMetadata,
+          url,
+          error: new UnsupportedSiteError(),
+          origin: req.body.origin ?? "api",
+          integration: req.body.integration,
+          zeroDataRetention: zeroDataRetention ?? false,
+        })),
+      );
+      locallyBlockedURLs.length = 0;
+      if (!res.headersSent) {
+        return res.status(403).json({
+          success: false,
+          error: UNSUPPORTED_SITE_MESSAGE,
+        });
+      }
+    }
+  }
+
+  emitRejectedScrapeActivityEvents(
+    locallyBlockedURLs.map(url => ({
+      scrapeId: uuidv7(),
+      requestId: id,
+      endpoint: "batch_scrape",
+      teamId: req.auth.team_id,
+      apiKeyId: req.acuc?.api_key_id ?? null,
+      auditMetadata: req.body.auditMetadata,
+      url,
+      error: new UnsupportedSiteError(),
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      zeroDataRetention: zeroDataRetention ?? false,
+    })),
+  );
+
+  // Threat protection: reject/report blocked URLs at enqueue time so they
+  // never consume scrape slots (mirrors the isUrlBlocked handling above).
+  if (threatProtection.policy) {
+    const { blocked, decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      urls,
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    if (blocked.length > 0) {
+      // Consulted decisions bill the scan fee (+2 per unique scanned URL) —
+      // the scans already happened. With ignoreInvalidURLs the allowed URLs
+      // proceed to scrape jobs that bill their own scans, so only blocked
+      // ones bill here; when the whole request is rejected below, no scrape
+      // jobs will ever run, so every scanned URL bills here.
+      const threatScanCredits = calculateThreatScanCredits(
+        req.body.ignoreInvalidURLs
+          ? blocked.map(x => x.decision)
+          : decisionsByUrl.values(),
+      );
+      if (threatScanCredits > 0) {
+        billTeam(
+          req.auth.team_id,
+          req.acuc?.org_id ?? null,
+          threatScanCredits,
+          req.acuc?.api_key_id ?? null,
+          {
+            endpoint: "batch_scrape",
+            externalRequestId: externalRequestId(req),
+            jobId: id,
+            // Appends reuse the batch id but each append's threat scans are a
+            // fresh charge — a shared key would underbill them. Appends stay
+            // keyless (per-request UUID in firebill).
+            ...(req.body.appendToId ? {} : { chargeId: `${id}:threat` }),
+          },
+        ).catch(error => {
+          logger.error(
+            `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
+          );
+        });
+      }
+      emitRejectedScrapeActivityEvents(
+        blocked.map(blockedUrl => ({
+          scrapeId: uuidv7(),
+          requestId: id,
+          endpoint: "batch_scrape",
+          teamId: req.auth.team_id,
+          apiKeyId: req.acuc?.api_key_id ?? null,
+          auditMetadata: req.body.auditMetadata,
+          url: blockedUrl.url,
+          error: new UnsafeDomainBlockedError(
+            blockedUrl.url,
+            blockedUrl.decision,
+          ),
+          threatDecisions: [blockedUrl.decision],
+          origin: req.body.origin ?? "api",
+          integration: req.body.integration,
+          zeroDataRetention: zeroDataRetention ?? false,
+        })),
+      );
+      if (req.body.ignoreInvalidURLs) {
+        const blockedSet = new Set(blocked.map(x => x.url));
+        const keptUnnormalized: string[] = [];
+        const keptUrls: string[] = [];
+        urls.forEach((u, i) => {
+          if (blockedSet.has(u)) {
+            invalidURLs!.push(unnormalizedURLs[i] ?? u);
+          } else {
+            keptUrls.push(u);
+            keptUnnormalized.push(unnormalizedURLs[i]);
+          }
+        });
+        urls = keptUrls;
+        unnormalizedURLs = keptUnnormalized;
+      } else {
+        const first = blocked[0];
+        const error = new UnsafeDomainBlockedError(first.url, first.decision);
+        return res.status(403).json({
+          success: false,
+          code: error.code,
+          error: error.message,
+        });
+      }
+    }
+  }
+
+  if (urls.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "No valid URLs provided",
+    });
   }
 
   logger.debug("Batch scrape " + id + " starting", {
@@ -68,28 +328,88 @@ export async function batchScrapeController(
   });
 
   if (!req.body.appendToId) {
-    await logCrawl(id, req.auth.team_id);
+    await logRequest({
+      id,
+      kind: "batch_scrape",
+      api_version: "v1",
+      external_request_id: externalRequestId(req),
+      team_id: req.auth.team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: urls[0] ?? "",
+      zeroDataRetention: zeroDataRetention || false,
+      api_key_id: req.acuc?.api_key_id ?? null,
+      jobAccessExpiresAt: new Date(
+        Date.now() + (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+      ),
+      creditsShards: requestCreditsShards(urls.length),
+    });
   }
 
-  let { remainingCredits } = req.account!;
-  const useDbAuthentication = process.env.USE_DB_AUTHENTICATION === "true";
-  if (!useDbAuthentication) {
-    remainingCredits = Infinity;
+  const { scrapeOptions, internalOptions } = fromV1ScrapeOptions(
+    req.body,
+    req.body.timeout,
+    req.auth.team_id,
+  );
+  if (safeMode.safeMode?.lockdown) {
+    scrapeOptions.maxAge =
+      typeof preNormalizedBody.maxAge === "number"
+        ? preNormalizedBody.maxAge
+        : undefined;
   }
 
-  const sc: StoredCrawl = req.body.appendToId
-    ? ((await getCrawl(req.body.appendToId)) as StoredCrawl)
+  const sc: StoredCrawl = appendTarget
+    ? appendTarget
     : {
         crawlerOptions: null,
-        scrapeOptions: req.body,
-        internalOptions: { disableSmartWaitCache: true, teamId: req.auth.team_id }, // NOTE: smart wait disabled for batch scrapes to ensure contentful scrape, speed does not matter
+        scrapeOptions,
+        internalOptions: {
+          ...internalOptions,
+          disableSmartWaitCache: true,
+          teamId: req.auth.team_id,
+          orgId: req.acuc?.org_id ?? null,
+          saveScrapeResultToGCS: config.GCS_FIRE_ENGINE_BUCKET_NAME
+            ? true
+            : false,
+          zeroDataRetention,
+          agentIndexOnly: (req as any).agentIndexOnly ?? false,
+          threatProtection: threatProtection.policy ?? undefined,
+          // Safe Mode resolves per-URL at the scrapeURL backstop from these flags.
+          teamFlags: req.acuc?.flags ?? null,
+          safeModeBypassed: safeMode.bypassed === true,
+        }, // NOTE: smart wait disabled for batch scrapes to ensure contentful scrape, speed does not matter
         team_id: req.auth.team_id,
         createdAt: Date.now(),
-        plan: req.auth.plan,
+        maxConcurrency: req.body.maxConcurrency,
+        zeroDataRetention,
+        v1: true,
+        webhook: req.body.webhook,
+        origin: req.body.origin,
       };
 
+  if (req.body.appendToId && sc.internalOptions) {
+    sc.internalOptions.bypassBilling = false;
+    // Refresh Safe Mode + threat-protection so appended jobs enforce the team's
+    // current policy, not whatever was stored when the batch was created.
+    sc.internalOptions.teamFlags = req.acuc?.flags ?? undefined;
+    sc.internalOptions.threatProtection = threatProtection.policy ?? undefined;
+    sc.internalOptions.safeModeBypassed = safeMode.bypassed === true;
+  }
+
   if (!req.body.appendToId) {
+    sc.queueBackend = await resolveNewGroupBackend(sc.team_id);
+    await crawlGroup.addGroup(
+      id,
+      sc.team_id,
+      (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+      {
+        backend: sc.queueBackend,
+        maxConcurrency: sc.maxConcurrency,
+        delaySeconds: sc.crawlerOptions?.delay,
+      },
+    );
     await saveCrawl(id, sc);
+    await markCrawlActive(id);
   }
 
   let jobPriority = 20;
@@ -99,38 +419,39 @@ export async function batchScrapeController(
   if (urls.length > 1000) {
     // set base to 21
     jobPriority = await getJobPriority({
-      plan: req.auth.plan,
       team_id: req.auth.team_id,
+      acuc: req.acuc,
       basePriority: 21,
     });
   }
   logger.debug("Using job priority " + jobPriority, { jobPriority });
+  const billing = {
+    endpoint: "batch_scrape" as const,
+    jobId: id,
+    externalRequestId: externalRequestId(req),
+  };
 
-  const scrapeOptions: ScrapeOptions = { ...req.body };
-  delete (scrapeOptions as any).urls;
-  delete (scrapeOptions as any).appendToId;
-
-  const jobs = urls.map((x) => {
-    return {
-      data: {
-        url: x,
-        mode: "single_urls" as const,
-        team_id: req.auth.team_id,
-        plan: req.auth.plan!,
-        crawlerOptions: null,
-        scrapeOptions,
-        origin: "api",
-        crawl_id: id,
-        sitemapped: true,
-        v1: true,
-        webhook: req.body.webhook,
-      },
-      opts: {
-        jobId: uuidv4(),
-        priority: 20,
-      },
-    };
-  });
+  const jobs = urls.map(x => ({
+    jobId: uuidv7(),
+    data: {
+      url: x,
+      mode: "single_urls" as const,
+      team_id: req.auth.team_id,
+      crawlerOptions: null,
+      scrapeOptions,
+      origin: "api",
+      integration: req.body.integration,
+      billing,
+      crawl_id: id,
+      sitemapped: true,
+      v1: true,
+      webhook: req.body.webhook,
+      internalOptions: sc.internalOptions,
+      zeroDataRetention: zeroDataRetention ?? false,
+      apiKeyId: req.acuc?.api_key_id ?? null,
+    },
+    priority: jobPriority,
+  }));
 
   await finishCrawlKickoff(id);
 
@@ -138,12 +459,14 @@ export async function batchScrapeController(
   await lockURLs(
     id,
     sc,
-    jobs.map((x) => x.data.url),
+    jobs.map(x => x.data.url),
+    logger,
   );
   logger.debug("Adding scrape jobs to Redis...");
   await addCrawlJobs(
     id,
-    jobs.map((x) => x.opts.jobId),
+    jobs.map(x => x.jobId),
+    logger,
   );
   logger.debug("Adding scrape jobs to BullMQ...");
   await addScrapeJobs(jobs);
@@ -152,22 +475,21 @@ export async function batchScrapeController(
     logger.debug("Calling webhook with batch_scrape.started...", {
       webhook: req.body.webhook,
     });
-    await callWebhook(
-      req.auth.team_id,
-      id,
-      null,
-      req.body.webhook,
-      true,
-      "batch_scrape.started",
-    );
+    const sender = await createWebhookSender({
+      teamId: req.auth.team_id,
+      jobId: id,
+      webhook: req.body.webhook,
+      v0: false,
+    });
+    await sender?.send(WebhookEvent.BATCH_SCRAPE_STARTED, { success: true });
   }
 
-  const protocol = process.env.ENV === "local" ? req.protocol : "https";
+  const protocol = req.protocol;
 
   return res.status(200).json({
     success: true,
     id,
-    url: `${protocol}://${req.get("host")}/v1/batch/scrape/${id}`,
+    url: `${protocol}://${req.host}/v1/batch/scrape/${id}`,
     invalidURLs,
   });
 }

@@ -1,11 +1,13 @@
 import { Logger } from "winston";
 import { z, ZodError } from "zod";
-import * as Sentry from "@sentry/node";
 import { MockState, saveMock } from "./mock";
-import { TimeoutSignal } from "../../../controllers/v1/types";
 import { fireEngineURL } from "../engines/fire-engine/scrape";
+import { fetch, Response, FormData, Agent } from "undici";
+import { cacheableLookup } from "./cacheableLookup";
+import dns from "dns";
+import { AbortManagerThrownError } from "./abortManager";
 
-export type RobustFetchParams<Schema extends z.Schema<any>> = {
+type RobustFetchParams<Schema extends z.Schema<any>> = {
   url: string;
   logger: Logger;
   method: "GET" | "POST" | "DELETE" | "PUT";
@@ -15,12 +17,90 @@ export type RobustFetchParams<Schema extends z.Schema<any>> = {
   dontParseResponse?: boolean;
   ignoreResponse?: boolean;
   ignoreFailure?: boolean;
+  ignoreFailureStatus?: boolean;
   requestId?: string;
   tryCount?: number;
   tryCooldown?: number;
   mock: MockState | null;
   abort?: AbortSignal;
+  useCacheableLookup?: boolean;
 };
+
+// Logs only, so err on the side of redacting: any header whose name looks like
+// it could carry a credential (Authorization, X-Auth-*, Cookie, X-Password,
+// X-Session-Id, X-Api-Key, X-Signature, ...).
+const SENSITIVE_HEADER =
+  /auth|cookie|api[-_]?key|token|secret|passw|credential|session|signature|jwt/i;
+
+export function redactHeaders(
+  headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (headers === undefined) return undefined;
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [
+      name,
+      SENSITIVE_HEADER.test(name) ? "[REDACTED]" : value,
+    ]),
+  );
+}
+
+// Action fields that carry user-typed text or script bodies. `write` text can
+// be a password; `executeJavascript` scripts can embed tokens (and the branding
+// script is large), so neither belongs in logs.
+const SENSITIVE_ACTION_FIELDS = ["text", "script"] as const;
+
+/**
+ * A copy of a scrape request body that is safe to log: credential headers and
+ * secret-carrying action payloads are replaced with "[REDACTED]".
+ */
+export function redactRequestBodyForLog<T>(body: T): T {
+  if (
+    body === null ||
+    typeof body !== "object" ||
+    Array.isArray(body) ||
+    body instanceof FormData
+  ) {
+    return body;
+  }
+  const { headers, actions } = body as {
+    headers?: unknown;
+    actions?: unknown;
+  };
+  return {
+    ...body,
+    ...(headers !== null && typeof headers === "object"
+      ? { headers: redactHeaders(headers as Record<string, string>) }
+      : {}),
+    ...(Array.isArray(actions)
+      ? {
+          actions: actions.map(action => {
+            if (action === null || typeof action !== "object") return action;
+            const redacted: Record<string, unknown> = { ...action };
+            for (const field of SENSITIVE_ACTION_FIELDS) {
+              if (field in redacted) redacted[field] = "[REDACTED]";
+            }
+            return redacted;
+          }),
+        }
+      : {}),
+  };
+}
+
+const robustAgent = new Agent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+  connect: {
+    lookup: cacheableLookup.lookup,
+  },
+});
+
+const robustAgentNoLookup = new Agent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+  connect: {
+    lookup: dns.lookup,
+  },
+});
 
 export async function robustFetch<
   Schema extends z.Schema<any>,
@@ -34,14 +114,16 @@ export async function robustFetch<
   schema,
   ignoreResponse = false,
   ignoreFailure = false,
+  ignoreFailureStatus = false,
   requestId = crypto.randomUUID(),
   tryCount = 1,
   tryCooldown,
   mock,
   abort,
+  useCacheableLookup = true,
 }: RobustFetchParams<Schema>): Promise<Output> {
   abort?.throwIfAborted();
-  
+
   const params = {
     url,
     logger,
@@ -51,9 +133,32 @@ export async function robustFetch<
     schema,
     ignoreResponse,
     ignoreFailure,
+    ignoreFailureStatus,
     tryCount,
     tryCooldown,
     abort,
+  };
+
+  // omit pdf file content and credentials from logs
+  const logBody = body?.input
+    ? {
+        ...body,
+        input: {
+          ...body.input,
+          file_content: undefined,
+        },
+      }
+    : body?.pdf
+      ? {
+          ...body,
+          pdf: undefined,
+        }
+      : body;
+  const logParams = {
+    ...params,
+    headers: redactHeaders(headers),
+    body: redactRequestBodyForLog(logBody),
+    logger: undefined,
   };
 
   let response: {
@@ -78,6 +183,7 @@ export async function robustFetch<
           ...(headers !== undefined ? headers : {}),
         },
         signal: abort,
+        dispatcher: useCacheableLookup ? robustAgent : robustAgentNoLookup,
         ...(body instanceof FormData
           ? {
               body,
@@ -89,14 +195,13 @@ export async function robustFetch<
             : {}),
       });
     } catch (error) {
-      if (error instanceof TimeoutSignal) {
+      if (error instanceof AbortManagerThrownError) {
         throw error;
       } else if (!ignoreFailure) {
-        Sentry.captureException(error);
         if (tryCount > 1) {
           logger.debug(
             "Request failed, trying " + (tryCount - 1) + " more times",
-            { params, error, requestId },
+            { params: logParams, error, requestId },
           );
           return await robustFetch({
             ...params,
@@ -105,10 +210,14 @@ export async function robustFetch<
             mock,
           });
         } else {
-          logger.debug("Request failed", { params, error, requestId });
+          logger.debug("Request failed", {
+            params: logParams,
+            error,
+            requestId,
+          });
           throw new Error("Request failed", {
             cause: {
-              params,
+              params: logParams,
               requestId,
               error,
             },
@@ -123,10 +232,11 @@ export async function robustFetch<
       return null as Output;
     }
 
+    const resp = await request.text();
     response = {
       status: request.status,
       headers: request.headers,
-      body: await request.text(), // NOTE: can this throw an exception?
+      body: resp, // NOTE: can this throw an exception?
     };
   } else {
     if (ignoreResponse === true) {
@@ -139,12 +249,9 @@ export async function robustFetch<
       let trueUrl = request.url.startsWith(fireEngineURL)
         ? request.url.replace(fireEngineURL, "<fire-engine>")
         : request.url;
-      
+
       let out = trueUrl + ";" + request.method;
-      if (
-        trueUrl.startsWith("<fire-engine>") &&
-        request.method === "POST"
-      ) {
+      if (trueUrl.startsWith("<fire-engine>") && request.method === "POST") {
         out += "f-e;" + request.body?.engine + ";" + request.body?.url;
       }
       return out;
@@ -152,7 +259,7 @@ export async function robustFetch<
 
     const thisId = makeRequestTypeId(params);
     const matchingMocks = mock.requests
-      .filter((x) => makeRequestTypeId(x.options) === thisId)
+      .filter(x => makeRequestTypeId(x.options) === thisId)
       .sort((a, b) => a.time - b.time);
     const nextI = mock.tracker[thisId] ?? 0;
     mock.tracker[thisId] = nextI + 1;
@@ -167,16 +274,27 @@ export async function robustFetch<
     };
   }
 
-  if (response.status >= 300) {
+  if (response.status >= 300 && !ignoreFailureStatus) {
     if (tryCount > 1) {
       logger.debug(
         "Request sent failure status, trying " + (tryCount - 1) + " more times",
-        { params, response, requestId },
+        {
+          params: logParams,
+          response: { status: response.status, body: response.body },
+          requestId,
+        },
       );
       if (tryCooldown !== undefined) {
-        await new Promise((resolve) =>
-          setTimeout(() => resolve(null), tryCooldown),
-        );
+        let timeoutHandle: NodeJS.Timeout | null = null;
+        try {
+          await new Promise<null>(resolve => {
+            timeoutHandle = setTimeout(() => resolve(null), tryCooldown);
+          });
+        } finally {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+        }
       }
       return await robustFetch({
         ...params,
@@ -186,14 +304,14 @@ export async function robustFetch<
       });
     } else {
       logger.debug("Request sent failure status", {
-        params,
-        response,
+        params: logParams,
+        response: { status: response.status, body: response.body },
         requestId,
       });
       throw new Error("Request sent failure status", {
         cause: {
-          params,
-          response,
+          params: logParams,
+          response: { status: response.status, body: response.body },
           requestId,
         },
       });
@@ -217,13 +335,13 @@ export async function robustFetch<
     data = JSON.parse(response.body);
   } catch (error) {
     logger.debug("Request sent malformed JSON", {
-      params,
-      response,
+      params: logParams,
+      response: { status: response.status, body: response.body },
       requestId,
     });
     throw new Error("Request sent malformed JSON", {
       cause: {
-        params,
+        params: logParams,
         response,
         requestId,
       },
@@ -236,15 +354,15 @@ export async function robustFetch<
     } catch (error) {
       if (error instanceof ZodError) {
         logger.debug("Response does not match provided schema", {
-          params,
-          response,
+          params: logParams,
+          response: { status: response.status, body: response.body },
           requestId,
           error,
           schema,
         });
         throw new Error("Response does not match provided schema", {
           cause: {
-            params,
+            params: logParams,
             response,
             requestId,
             error,
@@ -253,15 +371,15 @@ export async function robustFetch<
         });
       } else {
         logger.debug("Parsing response with provided schema failed", {
-          params,
-          response,
+          params: logParams,
+          response: { status: response.status, body: response.body },
           requestId,
           error,
           schema,
         });
         throw new Error("Parsing response with provided schema failed", {
           cause: {
-            params,
+            params: logParams,
             response,
             requestId,
             error,

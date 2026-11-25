@@ -1,35 +1,60 @@
 import { Response } from "express";
-import { supabaseGetJobByIdOnlyData } from "../../lib/supabase-jobs";
-import { scrapeStatusRateLimiter } from "../../services/rate-limiter";
+import { getJob } from "./crawl-status";
+import { logger as _logger } from "../../lib/logger";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { getScrapeJobAccess } from "../../lib/operational-job-access";
+import { normalizeJobAccessTeamId } from "../../lib/job-access-store";
 
 export async function scrapeStatusController(req: any, res: any) {
-  const allowedTeams = [
-    "41bdbfe1-0579-4d9b-b6d5-809f16be12f5",
-    "511544f2-2fce-4183-9c59-6c29b02c69b5",
-    "1ec9a0b3-6e7d-49a9-ad6c-9c598ba824c8",
-  ];
+  const logger = _logger.child({
+    module: "scrape-status",
+    method: "scrapeStatusController",
+    teamId: req.auth.team_id,
+    jobId: req.params.jobId,
+    scrapeId: req.params.jobId,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
+  });
 
-  if (!allowedTeams.includes(req.auth.team_id)) {
-    return res.status(403).json({
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
+    return res.status(400).json({
       success: false,
-      error: "Forbidden",
+      error:
+        "Your team has zero data retention enabled. This is not supported on scrape status. Please contact support@firecrawl.com to unblock this feature.",
     });
   }
 
-  const job = await supabaseGetJobByIdOnlyData(req.params.jobId);
+  const access = await getScrapeJobAccess(req.params.jobId);
 
-  if (
-    !allowedTeams.includes(job?.team_id) ||
-    job?.team_id !== req.auth.team_id
-  ) {
+  if (!access || access.expiresAtMs <= Date.now()) {
+    return res.status(404).json({
+      success: false,
+      error: "Job not found.",
+    });
+  }
+
+  // Access rows store the normalized team (preview and keyless callers map to
+  // a placeholder UUID), so compare against the same normalization.
+  if (access.teamId !== normalizeJobAccessTeamId(req.auth.team_id)) {
     return res.status(403).json({
       success: false,
       error: "You are not allowed to access this resource.",
     });
   }
 
+  const jobData = await getJob(req.params.jobId);
+  const data = Array.isArray(jobData?.returnvalue)
+    ? jobData?.returnvalue[0]
+    : jobData?.returnvalue;
+
+  if (!data) {
+    return res.status(404).json({
+      success: false,
+      error: "Job not found.",
+    });
+  }
+
   return res.status(200).json({
     success: true,
-    data: job?.docs[0],
+    data,
   });
 }

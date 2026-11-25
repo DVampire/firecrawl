@@ -1,19 +1,32 @@
-import { Document, ScrapeOptions, URLTrace, scrapeOptions } from "../../controllers/v1/types";
-import { PlanType } from "../../types";
-import { logger } from "../logger";
-import { getScrapeQueue } from "../../services/queue-service";
+import { v7 as uuidv7 } from "uuid";
+import { config } from "../../config";
+import {
+  Document,
+  ScrapeOptions,
+  TeamFlags,
+  URLTrace,
+  scrapeOptions as scrapeOptionsSchema,
+} from "../../controllers/v2/types";
 import { waitForJob } from "../../services/queue-jobs";
 import { addScrapeJob } from "../../services/queue-jobs";
 import { getJobPriority } from "../job-priority";
 import type { Logger } from "winston";
+import { requestContext } from "../request-context";
+import { isLockdownZeroDataRetention } from "../safe-mode";
+import { getScrapeZDR } from "../zdr-helpers";
+import { service } from "../../service";
+import { scrapeQueue } from "../../services/worker/nuq-router";
 
 interface ScrapeDocumentOptions {
   url: string;
   teamId: string;
-  plan: PlanType;
+  orgId?: string | null;
   origin: string;
   timeout: number;
   isSingleUrl?: boolean;
+  flags: TeamFlags | null;
+  apiKeyId: number | null;
+  requestId?: string;
 }
 
 export async function scrapeDocument(
@@ -22,16 +35,34 @@ export async function scrapeDocument(
   logger: Logger,
   internalScrapeOptions: Partial<ScrapeOptions> = { onlyMainContent: false },
 ): Promise<Document | null> {
-  const trace = urlTraces.find((t) => t.url === options.url);
+  const trace = urlTraces.find(t => t.url === options.url);
   if (trace) {
     trace.status = "scraped";
     trace.timing.scrapedAt = new Date().toISOString();
   }
 
+  if (
+    service.modules.blocklist.isBlocked(
+      options.url,
+      requestContext({
+        teamId: options.teamId,
+        zeroDataRetention:
+          getScrapeZDR(options.flags ?? undefined) === "forced" ||
+          isLockdownZeroDataRetention(options.flags, undefined),
+        flags: options.flags ?? null,
+        orgId: options.orgId ?? null,
+      }),
+      {
+        origin: options.origin,
+      },
+    )
+  ) {
+    return null;
+  }
+
   async function attemptScrape(timeout: number) {
-    const jobId = crypto.randomUUID();
+    const jobId = uuidv7();
     const jobPriority = await getJobPriority({
-      plan: options.plan,
       team_id: options.teamId,
       basePriority: 10,
     });
@@ -41,22 +72,40 @@ export async function scrapeDocument(
         url: options.url,
         mode: "single_urls",
         team_id: options.teamId,
-        scrapeOptions: scrapeOptions.parse({ ...internalScrapeOptions }),
+        scrapeOptions: scrapeOptionsSchema.parse({
+          ...internalScrapeOptions,
+          maxAge: 4 * 60 * 60 * 1000,
+        }),
         internalOptions: {
-          useCache: true,
           teamId: options.teamId,
+          orgId: options.orgId ?? null,
+          saveScrapeResultToGCS: config.GCS_FIRE_ENGINE_BUCKET_NAME
+            ? true
+            : false,
+          bypassBilling: true,
+          // Safe Mode resolves per-URL at the scrapeURL backstop from these flags.
+          teamFlags: options.flags ?? undefined,
         },
-        plan: options.plan,
         origin: options.origin,
         is_scrape: true,
+        from_extract: true,
+        startTime: Date.now(),
+        zeroDataRetention: false, // not supported
+        apiKeyId: options.apiKeyId,
+        requestId: options.requestId,
       },
-      {},
       jobId,
       jobPriority,
+      false,
+      true,
     );
 
-    const doc = await waitForJob<Document>(jobId, timeout);
-    await getScrapeQueue().remove(jobId);
+    const doc = await waitForJob(jobId, timeout, false, logger);
+    try {
+      await scrapeQueue.removeJob(jobId, logger);
+    } catch (error) {
+      logger.warn("Error removing job from queue", { error, scrapeId: jobId });
+    }
 
     if (trace) {
       trace.timing.completedAt = new Date().toISOString();
@@ -86,7 +135,7 @@ export async function scrapeDocument(
         logger.debug("Scrape finished!");
         return x;
       }
-      
+
       throw timeoutError;
     }
   } catch (error) {

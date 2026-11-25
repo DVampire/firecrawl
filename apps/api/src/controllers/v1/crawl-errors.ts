@@ -1,71 +1,105 @@
 import { Response } from "express";
+import { config } from "../../config";
 import {
   CrawlErrorsResponse,
   CrawlStatusParams,
   RequestWithAuth,
 } from "./types";
-import {
-  getCrawl,
-  getCrawlJobs,
-} from "../../lib/crawl-redis";
-import { getScrapeQueue, redisConnection } from "../../services/queue-service";
+import { getCrawl } from "../../lib/crawl-redis";
+import { redisEvictConnection } from "../../../src/services/redis";
 import { configDotenv } from "dotenv";
-import { Job } from "bullmq";
+import { getCrawlJobAccess } from "../../lib/operational-job-access";
+import { storedZeroDataRetention } from "../../lib/request-context";
+import { logger as _logger } from "../../lib/logger";
+import { deserializeTransportableError } from "../../lib/error-serde";
+import { TransportableError } from "../../lib/error";
+import { ThirdPartyDataTermsRequiredError } from "../../lib/exchange";
+import { scrapeQueue } from "../../services/worker/nuq-router";
 configDotenv();
-
-export async function getJob(id: string) {
-  const job = await getScrapeQueue().getJob(id);
-  if (!job) return job;
-
-  return job;
-}
-
-export async function getJobs(ids: string[]) {
-  const jobs: (Job & { id: string })[] = (
-    await Promise.all(ids.map((x) => getScrapeQueue().getJob(x)))
-  ).filter((x) => x) as (Job & { id: string })[];
-
-  return jobs;
-}
 
 export async function crawlErrorsController(
   req: RequestWithAuth<CrawlStatusParams, undefined, CrawlErrorsResponse>,
   res: Response<CrawlErrorsResponse>,
 ) {
   const sc = await getCrawl(req.params.jobId);
-  if (!sc) {
+
+  if (sc) {
+    if (sc.team_id !== req.auth.team_id) {
+      return res.status(403).json({ success: false, error: "Forbidden" });
+    }
+  } else if (config.USE_DB_AUTHENTICATION) {
+    const crawlTtlHours = req.acuc?.flags?.crawlTtlHours ?? 24;
+    let access;
+    try {
+      access = await getCrawlJobAccess(req.params.jobId);
+    } catch (requestError) {
+      _logger.error("Error getting request", { error: requestError });
+      throw requestError;
+    }
+
+    if (access && access.teamId !== req.auth.team_id) {
+      return res.status(403).json({ success: false, error: "Forbidden" });
+    }
+
+    if (access && access.expiresAtMs <= Date.now()) {
+      return res.status(404).json({ success: false, error: "Job expired" });
+    }
+
+    if (!access) {
+      return res.status(404).json({ success: false, error: "Job not found" });
+    }
+  } else {
     return res.status(404).json({ success: false, error: "Job not found" });
   }
 
-  if (sc.team_id !== req.auth.team_id) {
-    return res.status(403).json({ success: false, error: "Forbidden" });
-  }
+  const logger = _logger.child({
+    crawlId: req.params.jobId,
+    zeroDataRetention: storedZeroDataRetention(sc) ?? false,
+  });
+  const failedJobs = (
+    await scrapeQueue.getGroupJobs(
+      req.params.jobId,
+      "failed",
+      undefined,
+      0,
+      logger,
+    )
+  ).filter(x => x.failedReason);
 
-  let jobStatuses = await Promise.all(
-    (await getCrawlJobs(req.params.jobId)).map(
-      async (x) => [x, await getScrapeQueue().getJobState(x)] as const,
-    ),
-  );
-
-  const failedJobIDs: string[] = [];
-
-  for (const [id, status] of jobStatuses) {
-    if (status === "failed") {
-      failedJobIDs.push(id);
-    }
-  }
-
-  res.status(200).json({
-    errors: (await getJobs(failedJobIDs)).map((x) => ({
-      id: x.id,
-      timestamp:
-        x.finishedOn !== undefined
-          ? new Date(x.finishedOn).toISOString()
-          : undefined,
-      url: x.data.url,
-      error: x.failedReason,
-    })),
-    robotsBlocked: await redisConnection.smembers(
+  return res.status(200).json({
+    errors: failedJobs
+      .map(x => {
+        const error = deserializeTransportableError(
+          x.failedReason!,
+        ) as TransportableError | null;
+        if (error?.code === "SCRAPE_RACED_REDIRECT_ERROR") {
+          return null;
+        }
+        return {
+          id: x.id,
+          timestamp:
+            x.finishedAt !== undefined
+              ? new Date(x.finishedAt).toISOString()
+              : undefined,
+          url:
+            x.data && "url" in x.data
+              ? x.data.url
+              : "<redacted due to zero data retention>",
+          ...(error
+            ? {
+                code: error.code,
+                error: error.message,
+                ...(error instanceof ThirdPartyDataTermsRequiredError
+                  ? { requiresAction: error.requiresAction }
+                  : {}),
+              }
+            : {
+                error: x.failedReason!,
+              }),
+        };
+      })
+      .filter(x => x !== null),
+    robotsBlocked: await redisEvictConnection.smembers(
       "crawl:" + req.params.jobId + ":robots_blocked",
     ),
   });

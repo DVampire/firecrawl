@@ -1,131 +1,123 @@
 import { z } from "zod";
 import {
-  AuthCreditUsageChunk,
+  BaseScrapeOptions,
   ScrapeOptions,
-  Document as V1Document,
-  webhookSchema,
-} from "./controllers/v1/types";
-import { ExtractorOptions, Document } from "./lib/entities";
+  Document as V2Document,
+  TeamFlags,
+} from "./controllers/v2/types";
+import { AuthCreditUsageChunk } from "./controllers/v1/types";
+import { ExtractorOptions } from "./lib/entities";
 import { InternalOptions } from "./scraper/scrapeURL";
+import type { CostTracking } from "./lib/cost-tracking";
+import type { BillingMetadata } from "./services/billing/types";
+import type { RequestContext } from "./service/request-context";
+import { webhookSchema } from "./services/webhook/schema";
+import type { SerializedTraceContext } from "./lib/otel-tracer";
 
-type Mode = "crawl" | "single_urls" | "sitemap";
-
-export { Mode };
-
-export interface CrawlResult {
-  source: string;
-  content: string;
-  options?: {
-    summarize?: boolean;
-    summarize_max_chars?: number;
-  };
-  metadata?: any;
-  raw_context_id?: number | string;
-  permissions?: any[];
-}
-
-export interface IngestResult {
-  success: boolean;
-  error: string;
-  data: CrawlResult[];
-}
-
-export interface WebScraperOptions {
-  url: string;
-  mode: Mode;
-  crawlerOptions?: any;
-  scrapeOptions: ScrapeOptions;
-  internalOptions?: InternalOptions;
+type ScrapeJobCommon = {
+  /**
+   * The context of the request this job belongs to. A job created from
+   * another job has its parent's, copied whole. Absent on a payload written
+   * before the context existed; read it with `jobContext`.
+   */
+  ctx?: RequestContext;
+  concurrencyLimited?: boolean;
   team_id: string;
-  plan: string;
-  origin?: string;
+  zeroDataRetention: boolean;
+  billing?: BillingMetadata;
+  keylessReserved?: boolean;
+  traceContext?: SerializedTraceContext;
+  skipNuq?: boolean;
+  requestId?: string;
+  monitoring?: {
+    monitorId: string;
+    checkId: string;
+    targetId: string;
+    source: "explicit" | "discovered";
+  };
+};
+
+export type ScrapeJobData = ScrapeJobCommon &
+  (
+    | ScrapeJobSingleUrlsUnique
+    | ScrapeJobKickoffUnique
+    | ScrapeJobKickoffSitemapUnique
+  );
+
+type ScrapeJobSingleUrlsUnique = {
+  mode: "single_urls";
+
+  url: string;
+  crawlerOptions?: any;
+  scrapeOptions: BaseScrapeOptions;
+  internalOptions?: InternalOptions;
+  origin: string;
   crawl_id?: string;
   sitemapped?: boolean;
   webhook?: z.infer<typeof webhookSchema>;
   v1?: boolean;
+  integration?: string | null;
+
+  /**
+   * Disables billing on the worker side.
+   */
   is_scrape?: boolean;
+
   isCrawlSourceScrape?: boolean;
-}
+  from_extract?: boolean;
+  startTime?: number;
+
+  is_extract?: boolean;
+  apiKeyId: number | null;
+
+  logRequestPromise?: Promise<any>;
+};
+
+export type ScrapeJobSingleUrls = ScrapeJobCommon & ScrapeJobSingleUrlsUnique;
+
+type ScrapeJobKickoffUnique = {
+  mode: "kickoff";
+
+  url: string;
+  crawlerOptions?: any;
+  scrapeOptions: BaseScrapeOptions;
+  internalOptions?: InternalOptions;
+  origin: string;
+  integration?: string | null;
+  crawl_id: string;
+  webhook?: z.infer<typeof webhookSchema>;
+  v1: boolean;
+  apiKeyId: number | null;
+};
+
+export type ScrapeJobKickoff = ScrapeJobCommon & ScrapeJobKickoffUnique;
+
+type ScrapeJobKickoffSitemapUnique = {
+  mode: "kickoff_sitemap";
+
+  crawl_id: string;
+  sitemapUrl: string;
+  location?: ScrapeOptions["location"];
+  origin: string;
+  integration?: string | null;
+  webhook?: z.infer<typeof webhookSchema>;
+  v1: boolean;
+  apiKeyId: number | null;
+};
+
+export type ScrapeJobKickoffSitemap = ScrapeJobCommon &
+  ScrapeJobKickoffSitemapUnique;
 
 export interface RunWebScraperParams {
   url: string;
-  mode: Mode;
   scrapeOptions: ScrapeOptions;
   internalOptions?: InternalOptions;
-  // onSuccess: (result: V1Document, mode: string) => void;
-  // onError: (error: Error) => void;
   team_id: string;
   bull_job_id: string;
   priority?: number;
-  is_scrape?: boolean;
   is_crawl?: boolean;
   urlInvisibleInCurrentCrawl?: boolean;
-}
-
-export type RunWebScraperResult =
-  | {
-      success: false;
-      error: Error;
-    }
-  | {
-      success: true;
-      document: V1Document;
-    };
-
-export interface FirecrawlJob {
-  job_id?: string;
-  success: boolean;
-  message?: string;
-  num_docs: number;
-  docs: any[];
-  time_taken: number;
-  team_id: string;
-  mode: string;
-  url: string;
-  crawlerOptions?: any;
-  scrapeOptions?: any;
-  origin: string;
-  num_tokens?: number;
-  retry?: boolean;
-  crawl_id?: string;
-  tokens_billed?: number;
-  sources?: Record<string, string[]>;
-}
-
-export interface FirecrawlScrapeResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    data: Document;
-  };
-  error?: string;
-}
-
-export interface FirecrawlCrawlResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    jobId: string;
-  };
-  error?: string;
-}
-
-export interface FirecrawlCrawlStatusResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    data: Document[];
-  };
-  error?: string;
-}
-
-export interface FirecrawlExtractResponse {
-  statusCode: number;
-  body: {
-    success: boolean;
-    data: any[];
-  };
-  error?: string;
+  costTracking: CostTracking;
 }
 
 export enum RateLimiterMode {
@@ -137,76 +129,49 @@ export enum RateLimiterMode {
   Map = "map",
   Extract = "extract",
   ExtractStatus = "extractStatus",
+  Browser = "browser",
+  BrowserExecute = "browserExecute",
+  BrowserReplay = "browserReplay",
+  Account = "account",
+  SupportAsk = "supportAsk",
+  Research = "research",
+  DeveloperSearch = "developerSearch",
+  GovSearch = "govSearch",
+  Labs = "labs",
+  Exchange = "exchange",
+  ExchangeDiscover = "exchangeDiscover",
+  FreshFeed = "freshFeed",
 }
 
 export type AuthResponse =
   | {
       success: true;
       team_id: string;
+      org_id?: string | null;
       api_key?: string;
-      plan?: PlanType;
       chunk: AuthCreditUsageChunk | null;
+      // The hosted MCP made the call, as verified in supaAuthenticateUser.
+      hostedMcp?: boolean;
     }
   | {
       success: false;
       error: string;
       status: number;
+      // When true, send the agent OAuth-discovery WWW-Authenticate header even on
+      // non-401 responses (e.g. keyless cap 429s) so agents can find the key flow.
+      agentAuthDiscovery?: boolean;
+      // Machine-readable keyless quota details for trusted MCP recovery.
+      keylessReason?: "requests" | "credits";
+      retryAfterSeconds?: number;
+      // Keyless prompts: the signup link in `error`, for clients that relay it.
+      signupUrl?: string;
     };
 
 export enum NotificationType {
-  APPROACHING_LIMIT = "approachingLimit",
-  LIMIT_REACHED = "limitReached",
   RATE_LIMIT_REACHED = "rateLimitReached",
   AUTO_RECHARGE_SUCCESS = "autoRechargeSuccess",
   AUTO_RECHARGE_FAILED = "autoRechargeFailed",
   CONCURRENCY_LIMIT_REACHED = "concurrencyLimitReached",
   AUTO_RECHARGE_FREQUENT = "autoRechargeFrequent",
+  AGENT_SPONSOR_CONFIRM = "agentSponsorConfirm",
 }
-
-export type ScrapeLog = {
-  url: string;
-  scraper: string;
-  success?: boolean;
-  response_code?: number;
-  time_taken_seconds?: number;
-  proxy?: string;
-  retried?: boolean;
-  error_message?: string;
-  date_added?: string; // ISO 8601 format
-  html?: string;
-  ipv4_support?: boolean | null;
-  ipv6_support?: boolean | null;
-};
-
-export type PlanType =
-  | "starter"
-  | "standard"
-  | "scale"
-  | "hobby"
-  | "standardnew"
-  | "standardNew"
-  | "growth"
-  | "growthdouble"
-  | "etier2c"
-  | "etier1a"
-  | "etierscale1"
-  | "etierscale2"
-  | "etier2a"
-  | "free"
-  | "testSuite"
-  | "devB"
-  | "etier2d"
-  | "manual"
-  | "extract_starter"
-  | "extract_explorer"
-  | "extract_pro"
-  | "";
-
-export type WebhookEventType =
-  | "crawl.page"
-  | "batch_scrape.page"
-  | "crawl.started"
-  | "batch_scrape.started"
-  | "crawl.completed"
-  | "batch_scrape.completed"
-  | "crawl.failed";

@@ -1,32 +1,20 @@
-import express, { NextFunction, Request, Response } from "express";
+import express from "express";
 import { crawlController } from "../controllers/v1/crawl";
 // import { crawlStatusController } from "../../src/controllers/v1/crawl-status";
 import { scrapeController } from "../../src/controllers/v1/scrape";
 import { crawlStatusController } from "../controllers/v1/crawl-status";
 import { mapController } from "../controllers/v1/map";
-import {
-  ErrorResponse,
-  RequestWithACUC,
-  RequestWithAuth,
-  RequestWithMaybeAuth,
-} from "../controllers/v1/types";
 import { RateLimiterMode } from "../types";
-import { authenticateUser } from "../controllers/auth";
-import { createIdempotencyKey } from "../services/idempotency/create";
-import { validateIdempotencyKey } from "../services/idempotency/validate";
-import { checkTeamCredits } from "../services/billing/credit_billing";
+import { SEARCH_CREDITS_FEATURE_ID } from "../services/autumn/autumn.service";
 import expressWs from "express-ws";
 import { crawlStatusWSController } from "../controllers/v1/crawl-status-ws";
-import { isUrlBlocked } from "../scraper/WebScraper/utils/blocklist";
 import { crawlCancelController } from "../controllers/v1/crawl-cancel";
-import { logger } from "../lib/logger";
 import { scrapeStatusController } from "../controllers/v1/scrape-status";
 import { concurrencyCheckController } from "../controllers/v1/concurrency-check";
 import { batchScrapeController } from "../controllers/v1/batch-scrape";
 import { extractController } from "../controllers/v1/extract";
 import { extractStatusController } from "../controllers/v1/extract-status";
 import { creditUsageController } from "../controllers/v1/credit-usage";
-import { BLOCKLISTED_URL_MESSAGE } from "../lib/strings";
 import { searchController } from "../controllers/v1/search";
 import { crawlErrorsController } from "../controllers/v1/crawl-errors";
 import { generateLLMsTextController } from "../controllers/v1/generate-llmstxt";
@@ -34,147 +22,50 @@ import { generateLLMsTextStatusController } from "../controllers/v1/generate-llm
 import { deepResearchController } from "../controllers/v1/deep-research";
 import { deepResearchStatusController } from "../controllers/v1/deep-research-status";
 import { tokenUsageController } from "../controllers/v1/token-usage";
+import { ongoingCrawlsController } from "../controllers/v1/crawl-ongoing";
+import {
+  authMiddleware,
+  checkCreditsMiddleware,
+  blocklistMiddleware,
+  scrapeBlocklistMiddleware,
+  restrictedOptionsCountryCheck,
+  idempotencyMiddleware,
+  requestTimingMiddleware,
+  validateJobIdParam,
+  wrap,
+  inferIntegrationMiddleware,
+} from "./shared";
+import { queueStatusController } from "../controllers/v1/queue-status";
+import { creditUsageHistoricalController } from "../controllers/v1/credit-usage-historical";
 
-function checkCreditsMiddleware(
-  minimum?: number,
-): (req: RequestWithAuth, res: Response, next: NextFunction) => void {
-  return (req, res, next) => {
-    (async () => {
-      if (!minimum && req.body) {
-        minimum =
-          (req.body as any)?.limit ?? (req.body as any)?.urls?.length ?? 1;
-      }
-      const { success, remainingCredits, chunk } = await checkTeamCredits(
-        req.acuc,
-        req.auth.team_id,
-        minimum ?? 1,
-      );
-      if (chunk) {
-        req.acuc = chunk;
-      }
-      req.account = { remainingCredits };
-      if (!success) {
-        if (!minimum && req.body && (req.body as any).limit !== undefined && remainingCredits > 0) {
-          logger.warn("Adjusting limit to remaining credits", {
-            teamId: req.auth.team_id,
-            remainingCredits,
-            request: req.body,
-          });
-          (req.body as any).limit = remainingCredits;
-          return next();
-        }
-
-        const currencyName = req.acuc.is_extract ? "tokens" : "credits"
-        logger.error(
-          `Insufficient ${currencyName}: ${JSON.stringify({ team_id: req.auth.team_id, minimum, remainingCredits })}`,
-          {
-            teamId: req.auth.team_id,
-            minimum,
-            remainingCredits,
-            request: req.body,
-            path: req.path
-          }
-        );
-        if (!res.headersSent && req.auth.team_id !== "8c528896-7882-4587-a4b6-768b721b0b53") {
-          return res.status(402).json({
-            success: false,
-            error:
-              "Insufficient " + currencyName + " to perform this request. For more " + currencyName + ", you can upgrade your plan at " + (currencyName === "credits" ? "https://firecrawl.dev/pricing or try changing the request limit to a lower value" : "https://www.firecrawl.dev/extract#pricing") + ".",
-          });
-        }
-      }
-      next();
-    })().catch((err) => next(err));
-  };
-}
-
-export function authMiddleware(
-  rateLimiterMode: RateLimiterMode,
-): (req: RequestWithMaybeAuth, res: Response, next: NextFunction) => void {
-  return (req, res, next) => {
-    (async () => {
-      const auth = await authenticateUser(req, res, rateLimiterMode);
-
-      if (!auth.success) {
-        if (!res.headersSent) {
-          return res
-            .status(auth.status)
-            .json({ success: false, error: auth.error });
-        } else {
-          return;
-        }
-      }
-
-      const { team_id, plan, chunk } = auth;
-
-      req.auth = { team_id, plan };
-      req.acuc = chunk ?? undefined;
-      if (chunk) {
-        req.account = { remainingCredits: chunk.remaining_credits };
-      }
-      next();
-    })().catch((err) => next(err));
-  };
-}
-
-function idempotencyMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) {
-  (async () => {
-    if (req.headers["x-idempotency-key"]) {
-      const isIdempotencyValid = await validateIdempotencyKey(req);
-      if (!isIdempotencyValid) {
-        if (!res.headersSent) {
-          return res
-            .status(409)
-            .json({ success: false, error: "Idempotency key already used" });
-        }
-      }
-      createIdempotencyKey(req);
-    }
-    next();
-  })().catch((err) => next(err));
-}
-
-function blocklistMiddleware(req: Request, res: Response, next: NextFunction) {
-  if (typeof req.body.url === "string" && isUrlBlocked(req.body.url)) {
-    if (!res.headersSent) {
-      return res.status(403).json({
-        success: false,
-        error: BLOCKLISTED_URL_MESSAGE,
-      });
-    }
-  }
-  next();
-}
-
-export function wrap(
-  controller: (req: Request, res: Response) => Promise<any>,
-): (req: Request, res: Response, next: NextFunction) => any {
-  return (req, res, next) => {
-    controller(req, res).catch((err) => next(err));
-  };
-}
-
-expressWs(express());
+import { tokenUsageHistoricalController } from "../controllers/v1/token-usage-historical";
+import { deprecationMiddleware } from "../lib/deprecations";
 
 export const v1Router = express.Router();
+expressWs(express()).applyTo(v1Router);
+
+// Add timing middleware to all v1 routes
+v1Router.use(requestTimingMiddleware("v1"));
 
 v1Router.post(
   "/scrape",
-  authMiddleware(RateLimiterMode.Scrape),
+  authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
+  deprecationMiddleware("v1_scrape"),
+  inferIntegrationMiddleware,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(1),
-  blocklistMiddleware,
+  scrapeBlocklistMiddleware,
   wrap(scrapeController),
 );
 
 v1Router.post(
   "/crawl",
   authMiddleware(RateLimiterMode.Crawl),
+  deprecationMiddleware("v1_crawl"),
+  inferIntegrationMiddleware,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(),
-  blocklistMiddleware,
+  scrapeBlocklistMiddleware,
   idempotencyMiddleware,
   wrap(crawlController),
 );
@@ -182,6 +73,9 @@ v1Router.post(
 v1Router.post(
   "/batch/scrape",
   authMiddleware(RateLimiterMode.Scrape),
+  deprecationMiddleware("v1_batch_scrape"),
+  inferIntegrationMiddleware,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(),
   blocklistMiddleware,
   idempotencyMiddleware,
@@ -190,28 +84,52 @@ v1Router.post(
 
 v1Router.post(
   "/search",
-  authMiddleware(RateLimiterMode.Search),
-  checkCreditsMiddleware(),
+  authMiddleware(RateLimiterMode.Search, { allowKeyless: true }),
+  deprecationMiddleware("v1_search"),
+  inferIntegrationMiddleware,
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(undefined, SEARCH_CREDITS_FEATURE_ID),
   wrap(searchController),
 );
 
 v1Router.post(
   "/map",
   authMiddleware(RateLimiterMode.Map),
+  deprecationMiddleware("v1_map"),
+  inferIntegrationMiddleware,
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(mapController),
 );
 
 v1Router.get(
+  "/crawl/ongoing",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_crawl_ongoing"),
+  wrap(ongoingCrawlsController),
+);
+
+// Public facing, same as ongoing
+v1Router.get(
+  "/crawl/active",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_crawl_active"),
+  wrap(ongoingCrawlsController),
+);
+
+v1Router.get(
   "/crawl/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_crawl_status"),
+  validateJobIdParam,
   wrap(crawlStatusController),
 );
 
 v1Router.get(
   "/batch/scrape/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_batch_scrape_status"),
+  validateJobIdParam,
   // Yes, it uses the same controller as the normal crawl status controller
   wrap((req: any, res): any => crawlStatusController(req, res, true)),
 );
@@ -219,24 +137,28 @@ v1Router.get(
 v1Router.get(
   "/crawl/:jobId/errors",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_crawl_errors"),
   wrap(crawlErrorsController),
 );
 
 v1Router.get(
   "/batch/scrape/:jobId/errors",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_batch_scrape_errors"),
   wrap(crawlErrorsController),
 );
 
 v1Router.get(
   "/scrape/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_scrape_status"),
   wrap(scrapeStatusController),
 );
 
 v1Router.get(
   "/concurrency-check",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_concurrency_check"),
   wrap(concurrencyCheckController),
 );
 
@@ -245,38 +167,50 @@ v1Router.ws("/crawl/:jobId", crawlStatusWSController);
 v1Router.post(
   "/extract",
   authMiddleware(RateLimiterMode.Extract),
-  checkCreditsMiddleware(1),
+  inferIntegrationMiddleware,
+  deprecationMiddleware("v1_extract"),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(20),
   wrap(extractController),
 );
 
 v1Router.get(
   "/extract/:jobId",
   authMiddleware(RateLimiterMode.ExtractStatus),
+  deprecationMiddleware("v1_extract_status"),
   wrap(extractStatusController),
 );
 
 v1Router.post(
   "/llmstxt",
-  authMiddleware(RateLimiterMode.Extract),
+  authMiddleware(RateLimiterMode.Scrape),
+  deprecationMiddleware("v1_llmstxt"),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(1),
+  blocklistMiddleware,
   wrap(generateLLMsTextController),
 );
 
 v1Router.get(
   "/llmstxt/:jobId",
-  authMiddleware(RateLimiterMode.ExtractStatus),
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_llmstxt_status"),
   wrap(generateLLMsTextStatusController),
 );
 
 v1Router.post(
   "/deep-research",
-  authMiddleware(RateLimiterMode.Extract),
+  authMiddleware(RateLimiterMode.Crawl),
+  deprecationMiddleware("v1_deep_research"),
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(1),
   wrap(deepResearchController),
 );
 
 v1Router.get(
   "/deep-research/:jobId",
-  authMiddleware(RateLimiterMode.ExtractStatus),
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_deep_research_status"),
   wrap(deepResearchStatusController),
 );
 
@@ -285,6 +219,14 @@ v1Router.get(
 v1Router.delete(
   "/crawl/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_crawl_cancel"),
+  crawlCancelController,
+);
+
+v1Router.delete(
+  "/batch/scrape/:jobId",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_batch_scrape_cancel"),
   crawlCancelController,
 );
 // v1Router.get("/checkJobStatus/:jobId", crawlJobStatusPreviewController);
@@ -301,12 +243,35 @@ v1Router.delete(
 
 v1Router.get(
   "/team/credit-usage",
-  authMiddleware(RateLimiterMode.CrawlStatus),
+  authMiddleware(RateLimiterMode.Account),
+  deprecationMiddleware("v1_team_credit_usage"),
   wrap(creditUsageController),
 );
 
 v1Router.get(
+  "/team/credit-usage/historical",
+  authMiddleware(RateLimiterMode.Account),
+  deprecationMiddleware("v1_team_credit_usage_historical"),
+  wrap(creditUsageHistoricalController),
+);
+
+v1Router.get(
   "/team/token-usage",
-  authMiddleware(RateLimiterMode.ExtractStatus),
+  authMiddleware(RateLimiterMode.Account),
+  deprecationMiddleware("v1_team_token_usage"),
   wrap(tokenUsageController),
+);
+
+v1Router.get(
+  "/team/token-usage/historical",
+  authMiddleware(RateLimiterMode.Account),
+  deprecationMiddleware("v1_team_token_usage_historical"),
+  wrap(tokenUsageHistoricalController),
+);
+
+v1Router.get(
+  "/team/queue-status",
+  authMiddleware(RateLimiterMode.Account),
+  deprecationMiddleware("v1_team_queue_status"),
+  wrap(queueStatusController),
 );

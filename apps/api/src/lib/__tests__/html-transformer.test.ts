@@ -2,7 +2,8 @@ import {
   extractLinks,
   extractMetadata,
   transformHtml,
-} from "../html-transformer";
+  TransformHtmlOptions,
+} from "@mendable/firecrawl-rs";
 
 describe("HTML Transformer", () => {
   describe("extractLinks", () => {
@@ -94,12 +95,105 @@ describe("HTML Transformer", () => {
       expect(links).toContain("https://valid.com");
       // Other links should be filtered out or handled appropriately
     });
+
+    it("should handle base href for relative links", async () => {
+      const html = `
+        <html>
+          <head>
+            <base href="/" />
+          </head>
+          <body>
+            <a href="page.php">Page</a>
+            <a href="/absolute">Absolute</a>
+            <a href="https://external.com">External</a>
+          </body>
+        </html>
+      `;
+      const links = await extractLinks(html);
+      expect(links).toContain("page.php");
+      expect(links).toContain("/absolute");
+      expect(links).toContain("https://external.com");
+    });
+
+    it("should handle relative base href", async () => {
+      const html = `
+        <html>
+          <head>
+            <base href="../" />
+          </head>
+          <body>
+            <a href="page.php">Page</a>
+          </body>
+        </html>
+      `;
+      const links = await extractLinks(html);
+      expect(links).toContain("page.php");
+    });
+
+    it("should handle absolute base href", async () => {
+      const html = `
+        <html>
+          <head>
+            <base href="https://cdn.example.com/" />
+          </head>
+          <body>
+            <a href="assets/style.css">CSS</a>
+          </body>
+        </html>
+      `;
+      const links = await extractLinks(html);
+      expect(links).toContain("assets/style.css");
+    });
+
+    it("should use first base href when multiple exist", async () => {
+      const html = `
+        <html>
+          <head>
+            <base href="/" />
+            <base href="/other/" />
+          </head>
+          <body>
+            <a href="page.php">Page</a>
+          </body>
+        </html>
+      `;
+      const links = await extractLinks(html);
+      expect(links).toContain("page.php");
+    });
+
+    it("should fallback to page URL when no base href", async () => {
+      const html = `
+        <html>
+          <body>
+            <a href="page.php">Page</a>
+          </body>
+        </html>
+      `;
+      const links = await extractLinks(html);
+      expect(links).toContain("page.php");
+    });
+
+    it("should handle malformed base href gracefully", async () => {
+      const html = `
+        <html>
+          <head>
+            <base href="" />
+            <base />
+          </head>
+          <body>
+            <a href="page.php">Page</a>
+          </body>
+        </html>
+      `;
+      const links = await extractLinks(html);
+      expect(links).toContain("page.php");
+    });
   });
 
   describe("extractMetadata", () => {
-    it("should return empty array for null or undefined input", async () => {
-      expect(await extractMetadata(null)).toEqual([]);
-      expect(await extractMetadata(undefined)).toEqual([]);
+    it("should return empty object for null or undefined input", async () => {
+      expect(await extractMetadata(null)).toEqual({});
+      expect(await extractMetadata(undefined)).toEqual({});
     });
 
     it("should extract comprehensive metadata from HTML content", async () => {
@@ -167,16 +261,61 @@ describe("HTML Transformer", () => {
       const metadata = await extractMetadata(html);
       expect(metadata).toBeDefined();
     });
+
+    it("should backfill title from og:title when title tag is missing", async () => {
+      const html = `
+        <html>
+          <head>
+            <meta property="og:title" content="OpenGraph Title">
+            <meta name="description" content="Page description">
+          </head>
+          <body></body>
+        </html>
+      `;
+      const metadata = await extractMetadata(html);
+      expect(metadata.title).toBe("OpenGraph Title");
+      expect(metadata.ogTitle).toBe("OpenGraph Title");
+    });
+
+    it("should backfill title from twitter:title when title and og:title are missing", async () => {
+      const html = `
+        <html>
+          <head>
+            <meta name="twitter:title" content="Twitter Title">
+            <meta name="description" content="Page description">
+          </head>
+          <body></body>
+        </html>
+      `;
+      const metadata = await extractMetadata(html);
+      expect(metadata.title).toBe("Twitter Title");
+    });
+
+    it("should not backfill title when title tag exists", async () => {
+      const html = `
+        <html>
+          <head>
+            <title>Primary Title</title>
+            <meta property="og:title" content="OpenGraph Title">
+            <meta name="twitter:title" content="Twitter Title">
+          </head>
+          <body></body>
+        </html>
+      `;
+      const metadata = await extractMetadata(html);
+      expect(metadata.title).toBe("Primary Title");
+      expect(metadata.ogTitle).toBe("OpenGraph Title");
+    });
   });
 
   describe("transformHtml", () => {
     it("should transform HTML content according to options", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: "<div><p>Test</p><span>Remove me</span></div>",
         url: "https://example.com",
-        include_tags: ["p"],
-        exclude_tags: ["span"],
-        only_main_content: true,
+        includeTags: ["p"],
+        excludeTags: ["span"],
+        onlyMainContent: true,
       };
 
       const result = await transformHtml(options);
@@ -185,7 +324,7 @@ describe("HTML Transformer", () => {
     });
 
     it("should handle complex content filtering", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: `
           <div class="wrapper">
             <header>
@@ -204,9 +343,9 @@ describe("HTML Transformer", () => {
           </div>
         `,
         url: "https://example.com",
-        include_tags: ["article", "h1", "p"],
-        exclude_tags: ["nav", "aside", "footer", ".ads", ".social-share"],
-        only_main_content: true,
+        includeTags: ["article", "h1", "p"],
+        excludeTags: ["nav", "aside", "footer", ".ads", ".social-share"],
+        onlyMainContent: true,
       };
 
       const result = await transformHtml(options);
@@ -219,7 +358,7 @@ describe("HTML Transformer", () => {
     });
 
     it("should handle nested content preservation and absolute links", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: `
           <article>
             <div class="content">
@@ -233,9 +372,9 @@ describe("HTML Transformer", () => {
           </article>
         `,
         url: "https://example.com",
-        include_tags: ["article", "p", "ul", "li"],
-        exclude_tags: [],
-        only_main_content: true,
+        includeTags: ["article", "p", "ul", "li"],
+        excludeTags: [],
+        onlyMainContent: true,
       };
 
       const result = await transformHtml(options);
@@ -245,12 +384,12 @@ describe("HTML Transformer", () => {
     });
 
     it("should handle empty HTML content", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: "",
         url: "https://example.com",
-        include_tags: [],
-        exclude_tags: [],
-        only_main_content: false,
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
       };
 
       const result = await transformHtml(options);
@@ -258,12 +397,12 @@ describe("HTML Transformer", () => {
     });
 
     it("should handle malformed HTML", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: "<div>Unclosed div",
         url: "https://example.com",
-        include_tags: [],
-        exclude_tags: [],
-        only_main_content: false,
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
       };
 
       const result = await transformHtml(options);
@@ -271,7 +410,7 @@ describe("HTML Transformer", () => {
     });
 
     it("should handle HTML with comments and scripts", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: `
           <div>
             <!-- Comment -->
@@ -282,9 +421,9 @@ describe("HTML Transformer", () => {
           </div>
         `,
         url: "https://example.com",
-        include_tags: ["p"],
-        exclude_tags: ["script", "style", "noscript"],
-        only_main_content: true,
+        includeTags: ["p"],
+        excludeTags: ["script", "style", "noscript"],
+        onlyMainContent: true,
       };
 
       const result = await transformHtml(options);
@@ -295,7 +434,7 @@ describe("HTML Transformer", () => {
     });
 
     it("should handle special characters and encoding", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: `
           <div>
             <p>&copy; 2024</p>
@@ -305,9 +444,9 @@ describe("HTML Transformer", () => {
           </div>
         `,
         url: "https://example.com",
-        include_tags: ["p"],
-        exclude_tags: [],
-        only_main_content: true,
+        includeTags: ["p"],
+        excludeTags: [],
+        onlyMainContent: true,
       };
 
       const result = await transformHtml(options);
@@ -316,8 +455,79 @@ describe("HTML Transformer", () => {
       expect(result).toContain("🎉 👍 🚀");
     });
 
+    it("should pick the largest image from a lazy-loaded data-srcset", async () => {
+      // Lazy loaders keep a tiny placeholder in `src` and the real responsive
+      // image in `data-srcset` until the image scrolls into view.
+      const options: TransformHtmlOptions = {
+        html: `
+          <div>
+            <img
+              src="https://cdn.example.com/photo.png?width=5"
+              data-src="https://cdn.example.com/photo.png"
+              data-srcset="https://cdn.example.com/photo.png?width=320 320w, https://cdn.example.com/photo.png?width=1296 1296w">
+          </div>
+        `,
+        url: "https://example.com",
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
+      };
+
+      const result = await transformHtml(options);
+      expect(result).toContain(
+        'src="https://cdn.example.com/photo.png?width=1296"',
+      );
+      expect(result).not.toContain("width=5");
+    });
+
+    it("should fall back to data-src when there is no srcset", async () => {
+      const options: TransformHtmlOptions = {
+        html: `
+          <div>
+            <img
+              src="https://cdn.example.com/photo.png?width=5"
+              data-src="https://cdn.example.com/photo.png">
+          </div>
+        `,
+        url: "https://example.com",
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
+      };
+
+      const result = await transformHtml(options);
+      expect(result).toContain('src="https://cdn.example.com/photo.png"');
+      expect(result).not.toContain("width=5");
+    });
+
+    it("should prefer a real srcset over data-srcset when both are present", async () => {
+      // Once the lazy loader fires, `srcset` holds the real image; we must not
+      // override it with the (now stale) data-* attributes.
+      const options: TransformHtmlOptions = {
+        html: `
+          <div>
+            <img
+              src="https://cdn.example.com/real.png?width=800"
+              srcset="https://cdn.example.com/real.png?width=400 400w, https://cdn.example.com/real.png?width=800 800w"
+              data-srcset="https://cdn.example.com/placeholder.png?width=5 5w">
+          </div>
+        `,
+        url: "https://example.com",
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
+      };
+
+      const result = await transformHtml(options);
+      expect(result).toContain(
+        'src="https://cdn.example.com/real.png?width=800"',
+      );
+      // The src must not be overwritten by the (stale) data-srcset placeholder.
+      expect(result).not.toContain('src="https://cdn.example.com/placeholder');
+    });
+
     it("should make all URLs absolute", async () => {
-      const options = {
+      const options: TransformHtmlOptions = {
         html: `
           <div>
             <a href="https://example.com/fullurl">hi</a>
@@ -331,13 +541,13 @@ describe("HTML Transformer", () => {
           </div>
         `,
         url: "https://example.com",
-        include_tags: [],
-        exclude_tags: [],
-        only_main_content: true,
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: true,
       };
 
       const result = await transformHtml(options);
-      console.log(result)
+      console.log(result);
       expect(result).toContain("https://example.com/fullurl");
       expect(result).toContain("http://example.net/fullurl");
       expect(result).toContain("https://example.com/pathurl");
